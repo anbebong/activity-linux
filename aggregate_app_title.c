@@ -1,15 +1,13 @@
 /*
  * aggregate_app_title.c
  * ----------------------
- * Aggregate activity_usage.csv by (app_class, title).
+ * Aggregate activity intervals from SQLite (default) or legacy CSV.
  *
- * Expected CSV schema (header may exist):
+ * SQLite table `intervals`: start_ms, end_ms, window_id, app_class, pid, title
+ *
+ * CSV schema (header may exist):
  *   start_ts,end_ts,window_id,app_class,pid,title
- *
- * Where start_ts/end_ts are ISO local time with milliseconds:
- *   2026-03-20T15:52:10.123
- *
- * This tool computes duration_ms = end_ts - start_ts and sums it per key.
+ *   start_ts/end_ts: ISO local time with milliseconds
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -19,6 +17,8 @@
 #include <string.h>
 #include <time.h>
 
+#include <sqlite3.h>
+
 typedef struct
 {
     char app_class[256];
@@ -26,6 +26,52 @@ typedef struct
     long long total_ms;
     long long covered_end_ms; // latest end timestamp included in total_ms
 } Entry;
+
+typedef struct
+{
+    long long start_ms;
+    long long end_ms;
+    char window_id[64];
+    unsigned long pid;
+    char app_class[256];
+    char title[512];
+} ActivityRec;
+
+static void format_ts_iso_ms(char *dst, size_t dst_sz, long long ts_ms)
+{
+    if (!dst || dst_sz == 0) return;
+    time_t sec = (time_t)(ts_ms / 1000LL);
+    int ms = (int)(ts_ms % 1000LL);
+    if (ms < 0) ms = -ms;
+    struct tm tmv;
+    if (!localtime_r(&sec, &tmv))
+    {
+        snprintf(dst, dst_sz, "%lldms", ts_ms);
+        return;
+    }
+    char buf[32];
+    if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmv) == 0)
+    {
+        snprintf(dst, dst_sz, "%lldms", ts_ms);
+        return;
+    }
+    snprintf(dst, dst_sz, "%s.%03d", buf, ms);
+}
+
+static int append_rec(ActivityRec **arr, size_t *len, size_t *cap, const ActivityRec *r)
+{
+    if (*len == *cap)
+    {
+        size_t nc = *cap ? *cap * 2 : 64;
+        ActivityRec *p = realloc(*arr, nc * sizeof(*p));
+        if (!p) return -1;
+        *arr = p;
+        *cap = nc;
+    }
+    (*arr)[*len] = *r;
+    (*len)++;
+    return 0;
+}
 
 static long long parse_iso_ms(const char *s, int *ok)
 {
@@ -180,6 +226,128 @@ static int csv_split_6(const char *line, char out[6][2048])
     return 1;
 }
 
+static int load_records_csv(const char *path, ActivityRec **out, size_t *n_out)
+{
+    *out = NULL;
+    *n_out = 0;
+    size_t cap = 0;
+
+    FILE *f = fopen(path, "r");
+    if (!f)
+    {
+        fprintf(stderr, "Cannot open CSV: %s\n", path);
+        return -1;
+    }
+
+    char line[16384];
+    int is_header_checked = 0;
+
+    while (fgets(line, sizeof(line), f))
+    {
+        if (!is_header_checked)
+        {
+            is_header_checked = 1;
+            if (strncmp(line, "start_ts", 9) == 0)
+                continue;
+        }
+
+        char fields6[6][2048];
+        if (!csv_split_6(line, fields6))
+            continue;
+
+        int ok1 = 0, ok2 = 0;
+        long long start_ms = parse_iso_ms(fields6[0], &ok1);
+        long long end_ms = parse_iso_ms(fields6[1], &ok2);
+        if (!ok1 || !ok2 || end_ms <= start_ms)
+            continue;
+
+        ActivityRec r;
+        memset(&r, 0, sizeof(r));
+        r.start_ms = start_ms;
+        r.end_ms = end_ms;
+        strncpy(r.window_id, fields6[2], sizeof(r.window_id) - 1);
+        strncpy(r.app_class, fields6[3], sizeof(r.app_class) - 1);
+        r.pid = (unsigned long)strtoul(fields6[4], NULL, 10);
+        strncpy(r.title, fields6[5], sizeof(r.title) - 1);
+
+        if (append_rec(out, n_out, &cap, &r) != 0)
+        {
+            fclose(f);
+            free(*out);
+            *out = NULL;
+            *n_out = 0;
+            fprintf(stderr, "Out of memory loading CSV\n");
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
+}
+
+static int load_records_db(const char *path, ActivityRec **out, size_t *n_out)
+{
+    *out = NULL;
+    *n_out = 0;
+    size_t cap = 0;
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK || !db)
+    {
+        fprintf(stderr, "Cannot open database: %s\n",
+                db ? sqlite3_errmsg(db) : path);
+        if (db) sqlite3_close(db);
+        return -1;
+    }
+
+    sqlite3_stmt *st = NULL;
+    const char *sql =
+        "SELECT start_ms, end_ms, window_id, app_class, pid, title "
+        "FROM intervals ORDER BY start_ms ASC, id ASC;";
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        return -1;
+    }
+
+    while (sqlite3_step(st) == SQLITE_ROW)
+    {
+        ActivityRec r;
+        memset(&r, 0, sizeof(r));
+        r.start_ms = (long long)sqlite3_column_int64(st, 0);
+        r.end_ms = (long long)sqlite3_column_int64(st, 1);
+        const char *wid = (const char *)sqlite3_column_text(st, 2);
+        const char *ac = (const char *)sqlite3_column_text(st, 3);
+        r.pid = (unsigned long)sqlite3_column_int64(st, 4);
+        const char *tt = (const char *)sqlite3_column_text(st, 5);
+        if (wid)
+            strncpy(r.window_id, wid, sizeof(r.window_id) - 1);
+        if (ac)
+            strncpy(r.app_class, ac, sizeof(r.app_class) - 1);
+        if (tt)
+            strncpy(r.title, tt, sizeof(r.title) - 1);
+
+        if (r.end_ms <= r.start_ms)
+            continue;
+
+        if (append_rec(out, n_out, &cap, &r) != 0)
+        {
+            sqlite3_finalize(st);
+            sqlite3_close(db);
+            free(*out);
+            *out = NULL;
+            *n_out = 0;
+            fprintf(stderr, "Out of memory loading database\n");
+            return -1;
+        }
+    }
+
+    sqlite3_finalize(st);
+    sqlite3_close(db);
+    return 0;
+}
+
 static Entry *find_entry(Entry *arr, size_t len, const char *app_class, const char *title)
 {
     for (size_t i = 0; i < len; i++)
@@ -202,11 +370,15 @@ static int cmp_total_desc(const void *a, const void *b)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s --in FILE [--mode history|totals] [--top N] [--limit N]\n"
+            "Usage: %s [--db FILE.db | --in FILE.csv] [--mode history|totals] [--top N] [--limit N]\n"
+            "\n"
+            "Input (default: SQLite activity.db):\n"
+            "  --db PATH   Read intervals from SQLite table `intervals`.\n"
+            "  --in PATH   Read legacy CSV (same columns as before).\n"
             "\n"
             "Modes:\n"
             "  history  Print merged history (removes heartbeat-overlap duplicates) by (window_id,pid,app_class,title).\n"
-            "  history_raw  Print records as-is from CSV (may contain overlapping heartbeat snapshots).\n"
+            "  history_raw  Print records (may contain overlapping heartbeat snapshots).\n"
             "  totals    Compute total active time by (app_class,title) using start/end union.\n"
             "\n"
             "Output formats (optional):\n"
@@ -220,7 +392,8 @@ static void usage(const char *argv0)
 
 int main(int argc, char **argv)
 {
-    const char *in_path = "activity_usage.csv";
+    int src_use_csv = 0;
+    const char *input_path = "activity.db";
     int mode_history = 0;      // 1 => merged history, 2 => raw history
     size_t topn = 10;
     size_t limit = 0;
@@ -234,7 +407,13 @@ int main(int argc, char **argv)
     {
         if (strcmp(argv[i], "--in") == 0 && i + 1 < argc)
         {
-            in_path = argv[++i];
+            src_use_csv = 1;
+            input_path = argv[++i];
+        }
+        else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
+        {
+            src_use_csv = 0;
+            input_path = argv[++i];
         }
         else if (strcmp(argv[i], "--mode") == 0 && i + 1 < argc)
         {
@@ -300,90 +479,61 @@ int main(int argc, char **argv)
         }
     }
 
-    FILE *f = fopen(in_path, "r");
-    if (!f)
+    ActivityRec *recs = NULL;
+    size_t nrec = 0;
+    if (src_use_csv)
     {
-        fprintf(stderr, "Cannot open input: %s\n", in_path);
-        return 1;
+        if (load_records_csv(input_path, &recs, &nrec) != 0)
+            return 1;
+    }
+    else
+    {
+        if (load_records_db(input_path, &recs, &nrec) != 0)
+            return 1;
+    }
+
+    if (nrec == 0)
+    {
+        fprintf(stderr, "No records found in %s\n", input_path);
+        free(recs);
+        return 0;
     }
 
     if (mode_history == 2)
     {
-        char line[16384];
         if (!timefmt_hms)
         {
-            // Print header + records as-is.
-            while (fgets(line, sizeof(line), f))
+            printf("start_ts,end_ts,window_id,app_class,pid,title\n");
+            for (size_t i = 0; i < nrec; i++)
             {
-                if (limit > 0)
-                {
-                    // Count only data lines (skip header).
-                    if (strncmp(line, "start_ts", 9) == 0)
-                    {
-                        fputs(line, stdout);
-                        continue;
-                    }
-                    static size_t seen = 0;
-                    if (seen >= limit) break;
-                    seen++;
-                }
-                fputs(line, stdout);
+                if (limit > 0 && i >= limit) break;
+                ActivityRec *R = &recs[i];
+                char start_iso[64];
+                char end_iso[64];
+                format_ts_iso_ms(start_iso, sizeof(start_iso), R->start_ms);
+                format_ts_iso_ms(end_iso, sizeof(end_iso), R->end_ms);
+                printf("%s,%s,%s,%s,%lu,%s\n",
+                       start_iso, end_iso,
+                       R->window_id, R->app_class, R->pid, R->title);
             }
-            fclose(f);
+            free(recs);
             return 0;
         }
 
-        // timefmt_hms: parse & reformat start/end while printing records.
-        // Header stays the same (start_ts,end_ts,...).
-        int is_header_printed = 0;
-        while (fgets(line, sizeof(line), f))
+        printf("start_ts,end_ts,window_id,app_class,pid,title\n");
+        for (size_t i = 0; i < nrec; i++)
         {
-            if (limit > 0)
-            {
-                if (!is_header_printed)
-                    ;
-                static size_t seen = 0;
-                if (seen >= limit) break;
-                // Only count data lines.
-                if (strncmp(line, "start_ts", 9) != 0)
-                    seen++;
-            }
-
-            if (strncmp(line, "start_ts", 9) == 0)
-            {
-                if (!is_header_printed)
-                {
-                    fputs(line, stdout);
-                    is_header_printed = 1;
-                }
-                continue;
-            }
-
-            char fields6[6][2048];
-            if (!csv_split_6(line, fields6))
-                continue;
-
-            int ok1 = 0, ok2 = 0;
-            long long start_ms = parse_iso_ms(fields6[0], &ok1);
-            long long end_ms = parse_iso_ms(fields6[1], &ok2);
-            if (!ok1 || !ok2) continue;
-
+            if (limit > 0 && i >= limit) break;
+            ActivityRec *R = &recs[i];
             char start_s[64];
             char end_s[64];
-            format_ts_hms_ms(start_s, sizeof(start_s), start_ms);
-            format_ts_hms_ms(end_s, sizeof(end_s), end_ms);
-
-            const char *window_id = fields6[2];
-            const char *app_class = fields6[3];
-            unsigned long pid = (unsigned long)strtoul(fields6[4], NULL, 10);
-            const char *title = fields6[5];
-            if (!window_id || !app_class || !title) continue;
-
+            format_ts_hms_ms(start_s, sizeof(start_s), R->start_ms);
+            format_ts_hms_ms(end_s, sizeof(end_s), R->end_ms);
             printf("%s,%s,%s,%s,%lu,%s\n",
                    start_s, end_s,
-                   window_id, app_class, pid, title);
+                   R->window_id, R->app_class, R->pid, R->title);
         }
-        fclose(f);
+        free(recs);
         return 0;
     }
     else if (mode_history == 1)
@@ -418,32 +568,16 @@ int main(int argc, char **argv)
         size_t outs_len = 0;
         size_t outs_cap = 0;
 
-        char line[16384];
-        int is_header_checked = 0;
-
-        while (fgets(line, sizeof(line), f))
+        for (size_t ri = 0; ri < nrec; ri++)
         {
-            if (!is_header_checked)
-            {
-                is_header_checked = 1;
-                if (strncmp(line, "start_ts", 9) == 0)
-                    continue;
-            }
-
-            char fields6[6][2048];
-            if (!csv_split_6(line, fields6))
-                continue;
-
-            int ok1 = 0, ok2 = 0;
-            long long start_ms = parse_iso_ms(fields6[0], &ok1);
-            long long end_ms = parse_iso_ms(fields6[1], &ok2);
-            if (!ok1 || !ok2) continue;
+            long long start_ms = recs[ri].start_ms;
+            long long end_ms = recs[ri].end_ms;
             if (end_ms <= start_ms) continue;
 
-            const char *window_id = fields6[2];
-            const char *app_class = fields6[3];
-            unsigned long pid = (unsigned long)strtoul(fields6[4], NULL, 10);
-            const char *title = fields6[5];
+            const char *window_id = recs[ri].window_id;
+            const char *app_class = recs[ri].app_class;
+            unsigned long pid = recs[ri].pid;
+            const char *title = recs[ri].title;
             if (!window_id || !app_class || !title ||
                 !window_id[0] || !app_class[0] || !title[0])
                 continue;
@@ -604,7 +738,7 @@ int main(int argc, char **argv)
 
         free(states);
         free(outs);
-        fclose(f);
+        free(recs);
         return 0;
     }
 
@@ -612,30 +746,14 @@ int main(int argc, char **argv)
     size_t len = 0;
     size_t cap = 0;
 
-    char line[16384];
-    int is_header_checked = 0;
-
-    while (fgets(line, sizeof(line), f))
+    for (size_t ri = 0; ri < nrec; ri++)
     {
-        if (!is_header_checked)
-        {
-            is_header_checked = 1;
-            if (strncmp(line, "start_ts", 9) == 0)
-                continue;
-        }
-
-        char fields6[6][2048];
-        if (!csv_split_6(line, fields6))
-            continue;
-
-        int ok1 = 0, ok2 = 0;
-        long long start_ms = parse_iso_ms(fields6[0], &ok1);
-        long long end_ms = parse_iso_ms(fields6[1], &ok2);
-        if (!ok1 || !ok2) continue;
+        long long start_ms = recs[ri].start_ms;
+        long long end_ms = recs[ri].end_ms;
         if (end_ms <= start_ms) continue;
 
-        const char *app_class = fields6[3];
-        const char *title = fields6[5];
+        const char *app_class = recs[ri].app_class;
+        const char *title = recs[ri].title;
         if (!app_class || !title || !app_class[0] || !title[0]) continue;
 
         long long duration_ms = end_ms - start_ms;
@@ -694,11 +812,12 @@ int main(int argc, char **argv)
             e->covered_end_ms = end_ms;
     }
 
-    fclose(f);
+    free(recs);
+    recs = NULL;
 
     if (len == 0)
     {
-        fprintf(stderr, "No records found in %s\n", in_path);
+        fprintf(stderr, "No records found in %s\n", input_path);
         free(arr);
         return 0;
     }

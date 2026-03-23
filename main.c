@@ -1,7 +1,7 @@
 /*
  * activity/main.c
  * ---------------
- * X11 active window tracker (ghi interval active time ra CSV).
+ * X11 active window tracker (ghi interval active time ra SQLite).
  * Doc thiet ke: activity/DESIGN_X11.md
  */
 
@@ -11,13 +11,19 @@
 #include <X11/Xatom.h>
 #include <X11/Xutil.h>
 #include <signal.h>
+#include <sqlite3.h>
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/select.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -34,81 +40,82 @@ static long long now_ts_ms(void)
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
-static void format_ts_ms(char *dst, size_t dst_sz, long long ts_ms)
+static void local_date_str(char *buf, size_t buf_sz, long long ts_ms)
 {
-    if (!dst || dst_sz == 0) return;
-
+    if (!buf || buf_sz < 11) return;
     time_t sec = (time_t)(ts_ms / 1000LL);
-    int ms = (int)(ts_ms % 1000LL);
-    if (ms < 0) ms = -ms;
-
     struct tm tmv;
     if (!localtime_r(&sec, &tmv))
     {
-        // Fallback: print raw ms if localtime fails.
-        snprintf(dst, dst_sz, "%lldms", ts_ms);
+        buf[0] = '\0';
         return;
     }
-
-    char buf[32];
-    // Example: 2026-03-20T14:12:34
-    if (strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", &tmv) == 0)
-    {
-        snprintf(dst, dst_sz, "%lldms", ts_ms);
-        return;
-    }
-
-    // Append milliseconds: ...SS.mmm
-    snprintf(dst, dst_sz, "%s.%03d", buf, ms);
+    strftime(buf, buf_sz, "%Y-%m-%d", &tmv);
 }
 
-static void csv_escape(char *dst, size_t dst_sz, const char *src)
+static int build_archive_path(const char *db_path, const char *date_tag,
+                              char *dst, size_t dst_sz)
 {
-    // Escape CSV field:
-    // - Double quotes: " -> ""
-    // - If contains special char, wrap in quotes
-    size_t n = 0;
-    int needs_quotes = 0;
-    if (!src) src = "";
-
-    for (const char *p = src; *p; p++)
+    const char *slash = strrchr(db_path, '/');
+    const char *base = slash ? slash + 1 : db_path;
+    char dir[PATH_MAX];
+    if (slash)
     {
-        char c = *p;
-        if (c == ',' || c == '"' || c == '\n' || c == '\r')
-            needs_quotes = 1;
+        size_t l = (size_t)(slash - db_path);
+        if (l >= sizeof(dir)) return -1;
+        memcpy(dir, db_path, l);
+        dir[l] = '\0';
+    }
+    else
+    {
+        dir[0] = '\0';
     }
 
-    if (needs_quotes)
+    char stem[256];
+    strncpy(stem, base, sizeof(stem) - 1);
+    stem[sizeof(stem) - 1] = '\0';
+    size_t slen = strlen(stem);
+    if (slen >= 4 && stem[slen - 3] == '.' &&
+        (stem[slen - 2] == 'd' || stem[slen - 2] == 'D') &&
+        (stem[slen - 1] == 'b' || stem[slen - 1] == 'B'))
     {
-        if (dst_sz > 0) dst[n++] = '"';
+        stem[slen - 3] = '\0';
     }
 
-    for (const char *p = src; *p; p++)
+    if (dir[0])
     {
-        char c = *p;
-        if (n + 2 >= dst_sz) break;
-        if (c == '"')
-        {
-            dst[n++] = '"';
-            dst[n++] = '"';
-        }
-        else if (c == '\n' || c == '\r')
-        {
-            dst[n++] = ' ';
-        }
-        else
-        {
-            dst[n++] = c;
-        }
+        if (snprintf(dst, dst_sz, "%s/%s_%s.db", dir, stem, date_tag) >= (int)dst_sz)
+            return -1;
     }
-
-    if (needs_quotes)
+    else
     {
-        if (n + 1 < dst_sz) dst[n++] = '"';
+        if (snprintf(dst, dst_sz, "%s_%s.db", stem, date_tag) >= (int)dst_sz)
+            return -1;
     }
+    return 0;
+}
 
-    if (n < dst_sz) dst[n] = '\0';
-    else if (dst_sz > 0) dst[dst_sz - 1] = '\0';
+static int init_sqlite(sqlite3 *db)
+{
+    const char *sql =
+        "CREATE TABLE IF NOT EXISTS intervals ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "start_ms INTEGER NOT NULL,"
+        "end_ms INTEGER NOT NULL,"
+        "window_id TEXT NOT NULL,"
+        "app_class TEXT NOT NULL,"
+        "pid INTEGER NOT NULL,"
+        "title TEXT NOT NULL"
+        ");";
+    char *err = NULL;
+    if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite schema: %s\n", err ? err : "error");
+        sqlite3_free(err);
+        return -1;
+    }
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    return 0;
 }
 
 static unsigned long get_active_window(Display *dpy, Atom net_active_window, Window root)
@@ -239,51 +246,174 @@ static void get_app_title(Display *dpy, Window w, Atom net_wm_name, char *out_cl
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s --out FILE\n"
-            "Track X11 active window/tab by title changes (records start/end).\n",
+            "Usage: %s [--out FILE.db]\n"
+            "Track X11 active window/tab by title changes (records start/end in SQLite).\n"
+            "Default DB: activity.db\n"
+            "Daily rotation: at local midnight, FILE.db is renamed to STEM_YYYY-MM-DD.db\n"
+            "and a new FILE.db is created (same window continues with a fresh interval).\n",
             argv0);
 }
 
-static void write_record(FILE *f,
-                          long long start_ms,
-                          long long end_ms,
-                          unsigned long window_id,
-                          const char *app_class,
-                          unsigned long pid,
-                          const char *title)
+static int write_record(sqlite3_stmt *ins,
+                        long long start_ms,
+                        long long end_ms,
+                        unsigned long window_id,
+                        const char *app_class,
+                        unsigned long pid,
+                        const char *title)
 {
-    if (!f) return;
-    if (end_ms <= start_ms) return;
+    if (!ins) return 0;
+    if (end_ms <= start_ms) return 0;
 
-    char esc_app[256];
-    char esc_title[1024];
     char window_id_buf[32];
-    char start_ts_str[64];
-    char end_ts_str[64];
-
-    csv_escape(esc_app, sizeof(esc_app), app_class ? app_class : "unknown");
-    csv_escape(esc_title, sizeof(esc_title), title ? title : "unknown");
     snprintf(window_id_buf, sizeof(window_id_buf), "0x%lx", window_id);
-    format_ts_ms(start_ts_str, sizeof(start_ts_str), start_ms);
-    format_ts_ms(end_ts_str, sizeof(end_ts_str), end_ms);
 
-    fprintf(f,
-            "%s,%s,%s,%s,%lu,%s\n",
-            start_ts_str, end_ts_str,
-            window_id_buf, esc_app, pid, esc_title);
-    fflush(f);
+    const char *ac = app_class && app_class[0] ? app_class : "unknown";
+    const char *tt = title && title[0] ? title : "unknown";
+
+    sqlite3_reset(ins);
+    sqlite3_clear_bindings(ins);
+    sqlite3_bind_int64(ins, 1, (sqlite3_int64)start_ms);
+    sqlite3_bind_int64(ins, 2, (sqlite3_int64)end_ms);
+    sqlite3_bind_text(ins, 3, window_id_buf, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 4, ac, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins, 5, (sqlite3_int64)pid);
+    sqlite3_bind_text(ins, 6, tt, -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(ins) != SQLITE_DONE)
+    {
+        fprintf(stderr, "sqlite insert: %s\n", sqlite3_errmsg(sqlite3_db_handle(ins)));
+        return -1;
+    }
+    return 0;
+}
+
+static int rotate_db_at_day_change(
+    char db_path[PATH_MAX],
+    char active_day[16],
+    sqlite3 **db,
+    sqlite3_stmt **ins,
+    const char *ins_sql,
+    unsigned long *current_window,
+    long long *current_start_ms,
+    char *current_app,
+    char *current_title,
+    unsigned long *current_pid,
+    long long *next_flush_ms,
+    long long flush_interval_ms)
+{
+    long long t_now = now_ts_ms();
+    char today[16];
+    local_date_str(today, sizeof(today), t_now);
+    if (strcmp(today, active_day) == 0)
+        return 0;
+
+    char archive_path[PATH_MAX];
+    if (build_archive_path(db_path, active_day, archive_path, sizeof(archive_path)) != 0)
+    {
+        fprintf(stderr, "archive path too long\n");
+        return -1;
+    }
+
+    if (*current_window != 0 && *current_start_ms > 0 && t_now > *current_start_ms)
+    {
+        write_record(*ins,
+                     *current_start_ms, t_now,
+                     *current_window,
+                     current_app,
+                     *current_pid,
+                     current_title);
+    }
+
+    sqlite3_exec(*db, "PRAGMA wal_checkpoint(FULL);", NULL, NULL, NULL);
+    sqlite3_finalize(*ins);
+    *ins = NULL;
+    sqlite3_close(*db);
+    *db = NULL;
+
+    if (rename(db_path, archive_path) != 0)
+    {
+        fprintf(stderr, "rename %s -> %s: %s — reopening same file; day stamp advanced.\n",
+                db_path, archive_path, strerror(errno));
+        if (sqlite3_open(db_path, db) != SQLITE_OK || !*db)
+        {
+            fprintf(stderr, "Cannot reopen database %s after failed rename\n", db_path);
+            if (*db) sqlite3_close(*db);
+            *db = NULL;
+            return -1;
+        }
+        if (init_sqlite(*db) != 0)
+        {
+            sqlite3_close(*db);
+            *db = NULL;
+            return -1;
+        }
+        if (sqlite3_prepare_v2(*db, ins_sql, -1, ins, NULL) != SQLITE_OK)
+        {
+            fprintf(stderr, "sqlite prepare after failed rename: %s\n",
+                    sqlite3_errmsg(*db));
+            sqlite3_close(*db);
+            *db = NULL;
+            return -1;
+        }
+        snprintf(active_day, 16, "%s", today);
+        if (*current_window != 0)
+        {
+            *current_start_ms = t_now;
+            *next_flush_ms = t_now + flush_interval_ms;
+        }
+        return 0;
+    }
+
+    if (sqlite3_open(db_path, db) != SQLITE_OK || !*db)
+    {
+        fprintf(stderr, "Cannot reopen database %s after rotate\n", db_path);
+        if (*db) sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    if (init_sqlite(*db) != 0)
+    {
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+    if (sqlite3_prepare_v2(*db, ins_sql, -1, ins, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare after rotate: %s\n", sqlite3_errmsg(*db));
+        sqlite3_close(*db);
+        *db = NULL;
+        return -1;
+    }
+
+    snprintf(active_day, 16, "%s", today);
+
+    if (*current_window != 0)
+    {
+        *current_start_ms = t_now;
+        *next_flush_ms = t_now + flush_interval_ms;
+    }
+    else
+    {
+        *current_start_ms = 0;
+        *next_flush_ms = 0;
+    }
+
+    fprintf(stderr, "DB rotated: %s -> %s (new day %s)\n",
+            db_path, archive_path, today);
+    return 0;
 }
 
 int main(int argc, char **argv)
 {
-    const char *out_path = "activity_usage.csv";
+    const char *out_arg = "activity.db";
     const long long flush_interval_ms = 30000LL; // flush current tab every ~30s
 
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
         {
-            out_path = argv[++i];
+            out_arg = argv[++i];
         }
         else
         {
@@ -291,6 +421,15 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+
+    char db_path[PATH_MAX];
+    if (strlen(out_arg) >= sizeof(db_path))
+    {
+        fprintf(stderr, "--out path too long\n");
+        return 2;
+    }
+    strncpy(db_path, out_arg, sizeof(db_path) - 1);
+    db_path[sizeof(db_path) - 1] = '\0';
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -318,22 +457,37 @@ int main(int argc, char **argv)
     // Subscribe PropertyNotify on root for active-window changes.
     XSelectInput(dpy, root, PropertyChangeMask);
 
-    FILE *f = fopen(out_path, "a+");
-    if (!f)
+    static const char ins_sql[] =
+        "INSERT INTO intervals (start_ms,end_ms,window_id,app_class,pid,title) "
+        "VALUES (?,?,?,?,?,?);";
+
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK || !db)
     {
-        fprintf(stderr, "Cannot open output: %s: %s\n", out_path, strerror(errno));
+        fprintf(stderr, "Cannot open database: %s\n",
+                db ? sqlite3_errmsg(db) : db_path);
+        if (db) sqlite3_close(db);
+        XCloseDisplay(dpy);
+        return 1;
+    }
+    if (init_sqlite(db) != 0)
+    {
+        sqlite3_close(db);
         XCloseDisplay(dpy);
         return 1;
     }
 
-    // If file empty, write header.
-    fseek(f, 0, SEEK_END);
-    long fsz = ftell(f);
-    if (fsz == 0)
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(db, ins_sql, -1, &ins, NULL) != SQLITE_OK)
     {
-        fprintf(f, "start_ts,end_ts,window_id,app_class,pid,title\n");
-        fflush(f);
+        fprintf(stderr, "sqlite prepare: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        XCloseDisplay(dpy);
+        return 1;
     }
+
+    char active_day[16];
+    local_date_str(active_day, sizeof(active_day), now_ts_ms());
 
     unsigned long current_window = get_active_window(dpy, net_active_window, root);
     long long current_start_ms = 0;
@@ -375,8 +529,17 @@ int main(int argc, char **argv)
             break;
         }
 
+        if (rotate_db_at_day_change(db_path, active_day, &db, &ins, ins_sql,
+                                    &current_window, &current_start_ms,
+                                    current_app, current_title,
+                                    &current_pid, &next_flush_ms,
+                                    flush_interval_ms) != 0)
+        {
+            break;
+        }
+
         // Timeout: no X events. If we still have an open tab, flush it every
-        // ~30 seconds so the CSV is updated even without title/window changes.
+        // ~30 seconds so the DB is updated even without title/window changes.
         if (!(sel > 0 && FD_ISSET(xfd, &rfds)))
         {
             if (current_window != 0 && current_start_ms > 0 && next_flush_ms > 0)
@@ -384,7 +547,7 @@ int main(int argc, char **argv)
                 long long t_ms = now_ts_ms();
                 if (t_ms >= next_flush_ms)
                 {
-                    write_record(f,
+                    write_record(ins,
                                  current_start_ms, t_ms,
                                  current_window,
                                  current_app,
@@ -415,7 +578,7 @@ int main(int argc, char **argv)
 
                 if (current_window != 0 && current_start_ms > 0 && t_ms > current_start_ms)
                 {
-                    write_record(f,
+                    write_record(ins,
                                  current_start_ms, t_ms,
                                  current_window,
                                  current_app,
@@ -466,7 +629,7 @@ int main(int argc, char **argv)
                     continue;
 
                 // Close previous tab interval
-                write_record(f,
+                write_record(ins,
                              current_start_ms, t_ms,
                              current_window,
                              current_app,
@@ -491,7 +654,7 @@ int main(int argc, char **argv)
     long long end_ms = now_ts_ms();
     if (current_window != 0 && current_start_ms > 0 && end_ms > current_start_ms)
     {
-        write_record(f,
+        write_record(ins,
                      current_start_ms, end_ms,
                      current_window,
                      current_app,
@@ -499,7 +662,8 @@ int main(int argc, char **argv)
                      current_title);
     }
 
-    fclose(f);
+    sqlite3_finalize(ins);
+    sqlite3_close(db);
     XCloseDisplay(dpy);
     return 0;
 }

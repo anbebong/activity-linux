@@ -5,7 +5,7 @@
 - Mỗi khi active window thay đổi:
   - đóng interval cửa sổ cũ và ghi duration.
   - mở interval cửa sổ mới.
-- Ghi kết quả vào file CSV để có thể tính tổng thời gian theo ứng dụng/cửa sổ về sau.
+- Ghi kết quả vào **SQLite** (`activity.db` mặc định) để tính tổng thời gian theo ứng dụng/title về sau (aggregator vẫn có thể đọc CSV cũ qua `--in`).
 
 ## Gia dinh & pham vi
 - Chi ho tro X11 (khong ho tro Wayland thuan).
@@ -26,10 +26,10 @@
    - pid (tuy chon):
      - `_NET_WM_PID`
 
-3) Storage dang interval -> CSV
-   - Moi lan active window doi:
-     - ghi 1 record:
-       - `start_ts_ms, end_ts_ms, duration_ms, window_id, app_class, pid, title`
+3) Storage dang interval -> SQLite (bang `intervals`)
+   - Moi lan doi cua so / doi title (tab) hoac heartbeat ~30s:
+     - ghi 1 hang: `start_ms, end_ms, window_id, app_class, pid, title`
+   - **Xoay file theo ngay (local):** khi doi ngay duong lich, file dang ghi (vd. `activity.db`) duoc `rename` thanh `STEM_YYYY-MM-DD.db` (ngay vua ket thuc), tao lai `activity.db` rong; flush interval hien tai truoc khi dong DB.
 
 ## Module tach biet
 Thuc te de de maintain, tach thanh 2 module:
@@ -37,10 +37,10 @@ Thuc te de de maintain, tach thanh 2 module:
 ### Module A: Window Tracker
 - Chay event-driven tren X11.
 - Snapshot metadata (app_class/title/pid) tai thoi diem mo interval.
-- Ghi record interval vao file CSV append-only.
+- Ghi record interval vao SQLite (append INSERT).
 
 ### Module B: Aggregator (tong hop thong ke)
-- Doc file CSV do Module A ghi.
+- Doc SQLite (`aggregate-app-title --db`) hoac CSV legacy (`--in`).
 - Cong don duration_ms theo key:
   - mac dinh: `app_class`
   - co the mo rong: theo `title`
@@ -50,22 +50,12 @@ Thuc te de de maintain, tach thanh 2 module:
   - lan chay tiep theo chi doc phan moi.
 
 ## Giao tiep giua 2 module
-- Dung 1 file CSV duy nhat lam contract.
-- Module B chi can biet thu tu cot va cach CSV escape string.
+- Contract chinh: file SQLite + bang `intervals`.
+- CSV chi con la tuy chon tuong thich nguoc (`--in`).
 
-## Vi sao CSV?
-- Repo hien tai khong dam bao co libsqlite3-dev trong moi truong build.
-- CSV de kiem chung va tinh tong bang tool khac (Python/awk/spreadsheet).
-
-## Dinh dang CSV
-- header:
-  - `start_ts_ms,end_ts_ms,duration_ms,window_id,app_class,pid,title`
-- window_id:
-  - ghi dang hex (0x...), de phan biet.
-
-## Escaping CSV
-- Neu field co dau phay/dau ngoac kep/newline -> boc bang `"..."`.
-- `"` trong chuoi -> thay bang `""`.
+## Dinh dang CSV (legacy)
+- header: `start_ts,end_ts,window_id,app_class,pid,title` (ISO local + ms).
+- window_id: hex `0x...`.
 
 ## Summary khi thoat (khong UI)
 - In Top-N theo tong `duration_ms` nhom theo `app_class` trong pham vi 1 lan chay.

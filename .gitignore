@@ -1,2 +1,5 @@
 activity_usage.csv
 out/*
+*.db*
+third_party/sqlite/*.c
+third_party/sqlite/*.h
