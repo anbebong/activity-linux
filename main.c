@@ -29,11 +29,32 @@
 #define ACTIVITY_DEFAULT_DB "/opt/lancsmaster/data/activity.db"
 
 static volatile sig_atomic_t g_stop = 0;
+static volatile sig_atomic_t g_x11_badwindow_seen = 0;
 
 static void handle_signal(int sig)
 {
     (void)sig;
     g_stop = 1;
+}
+
+static int x11_error_handler(Display *dpy, XErrorEvent *ev)
+{
+    (void)dpy;
+    if (!ev) return 0;
+
+    // Window may disappear between focus event and metadata read.
+    // Ignore to keep tracker alive.
+    if (ev->error_code == BadWindow)
+    {
+        g_x11_badwindow_seen = 1;
+        return 0;
+    }
+
+    char errtxt[128];
+    XGetErrorText(dpy, ev->error_code, errtxt, sizeof(errtxt));
+    fprintf(stderr, "X11 error ignored: %s (code=%u, req=%u)\n",
+            errtxt, ev->error_code, ev->request_code);
+    return 0;
 }
 
 static long long now_ts_ms(void)
@@ -443,6 +464,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "XOpenDisplay failed. Is DISPLAY set?\n");
         return 1;
     }
+    XSetErrorHandler(x11_error_handler);
 
     Window root = DefaultRootWindow(dpy);
     Atom net_active_window = XInternAtom(dpy, "_NET_ACTIVE_WINDOW", False);
