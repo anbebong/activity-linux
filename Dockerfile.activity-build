@@ -1,0 +1,21 @@
+FROM centos:7
+
+# CentOS 7 is EOL; switch repos to vault.
+RUN sed -i \
+    -e 's|^mirrorlist=|#mirrorlist=|g' \
+    -e 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' \
+    /etc/yum.repos.d/CentOS-*.repo
+
+# Build toolchain and headers required by activity/Makefile.
+RUN yum install -y \
+        gcc \
+        make \
+        which \
+        tar \
+        gzip \
+        libX11-devel \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
+WORKDIR /work/src
+CMD ["/bin/bash"]

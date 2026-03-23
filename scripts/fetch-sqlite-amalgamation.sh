@@ -19,7 +19,4 @@ URL="https://sqlite.org/2026/sqlite-amalgamation-3510300.zip"
 
 echo "Fetching $URL"
 curl -fL -o "$ZIP" "$URL"
-unzip "$ZIP"
-rm -f "$ZIP"
-echo "OK: $DEST/sqlite3.c sqlite3.h"
-https://sqlite.org/2026/sqlite-amalgamation-3510300.zip
+unzip "$ZIP" -d "$DEST"
