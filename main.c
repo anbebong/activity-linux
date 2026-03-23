@@ -122,14 +122,16 @@ static int build_archive_path(const char *db_path, const char *date_tag,
 static int init_sqlite(sqlite3 *db)
 {
     const char *sql =
-        "CREATE TABLE IF NOT EXISTS intervals ("
+        "CREATE TABLE IF NOT EXISTS window_sessions ("
         "id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "start_ms INTEGER NOT NULL,"
-        "end_ms INTEGER NOT NULL,"
-        "window_id TEXT NOT NULL,"
-        "app_class TEXT NOT NULL,"
-        "pid INTEGER NOT NULL,"
-        "title TEXT NOT NULL"
+        "window_title TEXT NOT NULL,"
+        "process_name TEXT NOT NULL,"
+        "process_id INTEGER NOT NULL,"
+        "started_at_utc INTEGER NOT NULL,"
+        "last_seen_at_utc INTEGER NOT NULL,"
+        "ended_at_utc INTEGER,"
+        "duration_seconds INTEGER NOT NULL DEFAULT 0,"
+        "is_open INTEGER NOT NULL DEFAULT 1"
         ");";
     char *err = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
@@ -138,6 +140,8 @@ static int init_sqlite(sqlite3 *db)
         sqlite3_free(err);
         return -1;
     }
+    sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_open ON window_sessions(is_open, last_seen_at_utc);",
+                 NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
     return 0;
 }
@@ -278,35 +282,132 @@ static void usage(const char *argv0)
             argv0);
 }
 
-static int write_record(sqlite3_stmt *ins,
-                        long long start_ms,
-                        long long end_ms,
-                        unsigned long window_id,
-                        const char *app_class,
-                        unsigned long pid,
-                        const char *title)
+static int close_stale_open_sessions(sqlite3 *db, long long now_ms)
 {
-    if (!ins) return 0;
-    if (end_ms <= start_ms) return 0;
+    static const char sql[] =
+        "UPDATE window_sessions "
+        "SET is_open=0, "
+        "    ended_at_utc=?, "
+        "    last_seen_at_utc=?, "
+        "    duration_seconds=CASE WHEN ? >= started_at_utc THEN ? - started_at_utc ELSE 0 END "
+        "WHERE is_open=1;";
+    sqlite3_stmt *st = NULL;
+    long long now_s = now_ms / 1000LL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare close stale: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+    sqlite3_bind_int64(st, 1, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(st, 2, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(st, 3, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(st, 4, (sqlite3_int64)now_s);
+    if (sqlite3_step(st) != SQLITE_DONE)
+    {
+        fprintf(stderr, "sqlite close stale: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(st);
+        return -1;
+    }
+    sqlite3_finalize(st);
+    return 0;
+}
 
-    char window_id_buf[32];
-    snprintf(window_id_buf, sizeof(window_id_buf), "0x%lx", window_id);
-
-    const char *ac = app_class && app_class[0] ? app_class : "unknown";
+static int open_session(sqlite3_stmt *ins,
+                        sqlite3 *db,
+                        const char *title,
+                        const char *process_name,
+                        unsigned long process_id,
+                        long long now_ms,
+                        long long *session_id_out)
+{
+    if (!ins || !db) return -1;
     const char *tt = title && title[0] ? title : "unknown";
+    const char *pn = process_name && process_name[0] ? process_name : "unknown";
+    long long now_s = now_ms / 1000LL;
 
     sqlite3_reset(ins);
     sqlite3_clear_bindings(ins);
-    sqlite3_bind_int64(ins, 1, (sqlite3_int64)start_ms);
-    sqlite3_bind_int64(ins, 2, (sqlite3_int64)end_ms);
-    sqlite3_bind_text(ins, 3, window_id_buf, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(ins, 4, ac, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(ins, 5, (sqlite3_int64)pid);
-    sqlite3_bind_text(ins, 6, tt, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 1, tt, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(ins, 2, pn, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(ins, 3, (sqlite3_int64)process_id);
+    sqlite3_bind_int64(ins, 4, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(ins, 5, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(ins, 6, (sqlite3_int64)0);
 
     if (sqlite3_step(ins) != SQLITE_DONE)
     {
-        fprintf(stderr, "sqlite insert: %s\n", sqlite3_errmsg(sqlite3_db_handle(ins)));
+        fprintf(stderr, "sqlite insert session: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+    if (session_id_out)
+        *session_id_out = (long long)sqlite3_last_insert_rowid(db);
+    return 0;
+}
+
+static int update_session_realtime(sqlite3_stmt *upd, sqlite3 *db, long long session_id, long long now_ms)
+{
+    if (!upd || !db || session_id <= 0) return 0;
+    long long now_s = now_ms / 1000LL;
+    sqlite3_reset(upd);
+    sqlite3_clear_bindings(upd);
+    sqlite3_bind_int64(upd, 1, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(upd, 2, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(upd, 3, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(upd, 4, (sqlite3_int64)session_id);
+    if (sqlite3_step(upd) != SQLITE_DONE)
+    {
+        fprintf(stderr, "sqlite update session: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+    return 0;
+}
+
+static int close_session(sqlite3_stmt *cls, sqlite3 *db, long long session_id, long long now_ms)
+{
+    if (!cls || !db || session_id <= 0) return 0;
+    long long now_s = now_ms / 1000LL;
+    sqlite3_reset(cls);
+    sqlite3_clear_bindings(cls);
+    sqlite3_bind_int64(cls, 1, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(cls, 2, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(cls, 3, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(cls, 4, (sqlite3_int64)now_s);
+    sqlite3_bind_int64(cls, 5, (sqlite3_int64)session_id);
+    if (sqlite3_step(cls) != SQLITE_DONE)
+    {
+        fprintf(stderr, "sqlite close session: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+    return 0;
+}
+
+static int prepare_session_statements(sqlite3 *db,
+                                      sqlite3_stmt **ins,
+                                      sqlite3_stmt **upd,
+                                      sqlite3_stmt **cls,
+                                      const char *ins_sql,
+                                      const char *upd_sql,
+                                      const char *cls_sql)
+{
+    if (sqlite3_prepare_v2(db, ins_sql, -1, ins, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare insert session: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+    if (sqlite3_prepare_v2(db, upd_sql, -1, upd, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare update session: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(*ins);
+        *ins = NULL;
+        return -1;
+    }
+    if (sqlite3_prepare_v2(db, cls_sql, -1, cls, NULL) != SQLITE_OK)
+    {
+        fprintf(stderr, "sqlite prepare close session: %s\n", sqlite3_errmsg(db));
+        sqlite3_finalize(*ins);
+        sqlite3_finalize(*upd);
+        *ins = NULL;
+        *upd = NULL;
         return -1;
     }
     return 0;
@@ -317,12 +418,17 @@ static int rotate_db_at_day_change(
     char active_day[16],
     sqlite3 **db,
     sqlite3_stmt **ins,
+    sqlite3_stmt **upd,
+    sqlite3_stmt **cls,
     const char *ins_sql,
+    const char *upd_sql,
+    const char *cls_sql,
     unsigned long *current_window,
     long long *current_start_ms,
     char *current_app,
     char *current_title,
     unsigned long *current_pid,
+    long long *current_session_id,
     long long *next_flush_ms,
     long long flush_interval_ms)
 {
@@ -339,19 +445,16 @@ static int rotate_db_at_day_change(
         return -1;
     }
 
-    if (*current_window != 0 && *current_start_ms > 0 && t_now > *current_start_ms)
-    {
-        write_record(*ins,
-                     *current_start_ms, t_now,
-                     *current_window,
-                     current_app,
-                     *current_pid,
-                     current_title);
-    }
+    if (*current_window != 0 && *current_session_id > 0)
+        close_session(*cls, *db, *current_session_id, t_now);
 
     sqlite3_exec(*db, "PRAGMA wal_checkpoint(FULL);", NULL, NULL, NULL);
     sqlite3_finalize(*ins);
+    sqlite3_finalize(*upd);
+    sqlite3_finalize(*cls);
     *ins = NULL;
+    *upd = NULL;
+    *cls = NULL;
     sqlite3_close(*db);
     *db = NULL;
 
@@ -372,10 +475,8 @@ static int rotate_db_at_day_change(
             *db = NULL;
             return -1;
         }
-        if (sqlite3_prepare_v2(*db, ins_sql, -1, ins, NULL) != SQLITE_OK)
+        if (prepare_session_statements(*db, ins, upd, cls, ins_sql, upd_sql, cls_sql) != 0)
         {
-            fprintf(stderr, "sqlite prepare after failed rename: %s\n",
-                    sqlite3_errmsg(*db));
             sqlite3_close(*db);
             *db = NULL;
             return -1;
@@ -384,6 +485,8 @@ static int rotate_db_at_day_change(
         if (*current_window != 0)
         {
             *current_start_ms = t_now;
+            if (open_session(*ins, *db, current_title, current_app, *current_pid, t_now, current_session_id) != 0)
+                return -1;
             *next_flush_ms = t_now + flush_interval_ms;
         }
         return 0;
@@ -402,9 +505,8 @@ static int rotate_db_at_day_change(
         *db = NULL;
         return -1;
     }
-    if (sqlite3_prepare_v2(*db, ins_sql, -1, ins, NULL) != SQLITE_OK)
+    if (prepare_session_statements(*db, ins, upd, cls, ins_sql, upd_sql, cls_sql) != 0)
     {
-        fprintf(stderr, "sqlite prepare after rotate: %s\n", sqlite3_errmsg(*db));
         sqlite3_close(*db);
         *db = NULL;
         return -1;
@@ -415,11 +517,14 @@ static int rotate_db_at_day_change(
     if (*current_window != 0)
     {
         *current_start_ms = t_now;
+        if (open_session(*ins, *db, current_title, current_app, *current_pid, t_now, current_session_id) != 0)
+            return -1;
         *next_flush_ms = t_now + flush_interval_ms;
     }
     else
     {
         *current_start_ms = 0;
+        *current_session_id = 0;
         *next_flush_ms = 0;
     }
 
@@ -431,7 +536,7 @@ static int rotate_db_at_day_change(
 int main(int argc, char **argv)
 {
     const char *out_arg = ACTIVITY_DEFAULT_DB;
-    const long long flush_interval_ms = 30000LL; // flush current tab every ~30s
+    const long long flush_interval_ms = 5000LL; // flush current tab every ~5s
 
     for (int i = 1; i < argc; i++)
     {
@@ -483,8 +588,20 @@ int main(int argc, char **argv)
     XSelectInput(dpy, root, PropertyChangeMask);
 
     static const char ins_sql[] =
-        "INSERT INTO intervals (start_ms,end_ms,window_id,app_class,pid,title) "
-        "VALUES (?,?,?,?,?,?);";
+        "INSERT INTO window_sessions "
+        "(window_title,process_name,process_id,started_at_utc,last_seen_at_utc,duration_seconds,is_open) "
+        "VALUES (?,?,?,?,?,?,1);";
+    static const char upd_sql[] =
+        "UPDATE window_sessions "
+        "SET last_seen_at_utc=?, "
+        "    duration_seconds=CASE WHEN ? >= started_at_utc THEN ? - started_at_utc ELSE 0 END "
+        "WHERE id=? AND is_open=1;";
+    static const char cls_sql[] =
+        "UPDATE window_sessions "
+        "SET last_seen_at_utc=?, ended_at_utc=?, "
+        "    duration_seconds=CASE WHEN ? >= started_at_utc THEN ? - started_at_utc ELSE 0 END, "
+        "    is_open=0 "
+        "WHERE id=? AND is_open=1;";
 
     sqlite3 *db = NULL;
     if (sqlite3_open(db_path, &db) != SQLITE_OK || !db)
@@ -503,9 +620,19 @@ int main(int argc, char **argv)
     }
 
     sqlite3_stmt *ins = NULL;
-    if (sqlite3_prepare_v2(db, ins_sql, -1, &ins, NULL) != SQLITE_OK)
+    sqlite3_stmt *upd = NULL;
+    sqlite3_stmt *cls = NULL;
+    if (prepare_session_statements(db, &ins, &upd, &cls, ins_sql, upd_sql, cls_sql) != 0)
     {
-        fprintf(stderr, "sqlite prepare: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        XCloseDisplay(dpy);
+        return 1;
+    }
+    if (close_stale_open_sessions(db, now_ts_ms()) != 0)
+    {
+        sqlite3_finalize(ins);
+        sqlite3_finalize(upd);
+        sqlite3_finalize(cls);
         sqlite3_close(db);
         XCloseDisplay(dpy);
         return 1;
@@ -519,6 +646,7 @@ int main(int argc, char **argv)
     char current_app[128] = {0};
     char current_title[512] = {0};
     unsigned long current_pid = 0;
+    long long current_session_id = 0;
     long long next_flush_ms = 0;
 
     if (current_window != 0)
@@ -529,6 +657,15 @@ int main(int argc, char **argv)
                        current_title, sizeof(current_title));
         current_pid = get_window_pid(dpy, net_wm_pid, (Window)current_window);
         XSelectInput(dpy, (Window)current_window, PropertyChangeMask);
+        if (open_session(ins, db, current_title, current_app, current_pid, current_start_ms, &current_session_id) != 0)
+        {
+            sqlite3_finalize(ins);
+            sqlite3_finalize(upd);
+            sqlite3_finalize(cls);
+            sqlite3_close(db);
+            XCloseDisplay(dpy);
+            return 1;
+        }
         next_flush_ms = current_start_ms + flush_interval_ms;
     }
 
@@ -554,10 +691,10 @@ int main(int argc, char **argv)
             break;
         }
 
-        if (rotate_db_at_day_change(db_path, active_day, &db, &ins, ins_sql,
+        if (rotate_db_at_day_change(db_path, active_day, &db, &ins, &upd, &cls, ins_sql, upd_sql, cls_sql,
                                     &current_window, &current_start_ms,
                                     current_app, current_title,
-                                    &current_pid, &next_flush_ms,
+                                    &current_pid, &current_session_id, &next_flush_ms,
                                     flush_interval_ms) != 0)
         {
             break;
@@ -572,15 +709,7 @@ int main(int argc, char **argv)
                 long long t_ms = now_ts_ms();
                 if (t_ms >= next_flush_ms)
                 {
-                    write_record(ins,
-                                 current_start_ms, t_ms,
-                                 current_window,
-                                 current_app,
-                                 current_pid,
-                                 current_title);
-                    // Keep the original current_start_ms until tab/window
-                    // actually changes. This way each heartbeat is a snapshot:
-                    // (current_start, now).
+                    update_session_realtime(upd, db, current_session_id, t_ms);
                     next_flush_ms = t_ms + flush_interval_ms;
                 }
             }
@@ -601,19 +730,13 @@ int main(int argc, char **argv)
 
                 long long t_ms = now_ts_ms();
 
-                if (current_window != 0 && current_start_ms > 0 && t_ms > current_start_ms)
-                {
-                    write_record(ins,
-                                 current_start_ms, t_ms,
-                                 current_window,
-                                 current_app,
-                                 current_pid,
-                                 current_title);
-                }
+                if (current_window != 0 && current_session_id > 0)
+                    close_session(cls, db, current_session_id, t_ms);
 
                 current_window = new_window;
                 current_start_ms = 0;
                 current_pid = 0;
+                current_session_id = 0;
                 current_app[0] = '\0';
                 current_title[0] = '\0';
                 next_flush_ms = 0;
@@ -626,6 +749,11 @@ int main(int argc, char **argv)
                                    current_title, sizeof(current_title));
                     current_pid = get_window_pid(dpy, net_wm_pid, (Window)current_window);
                     XSelectInput(dpy, (Window)current_window, PropertyChangeMask);
+                    if (open_session(ins, db, current_title, current_app, current_pid, current_start_ms, &current_session_id) != 0)
+                    {
+                        g_stop = 1;
+                        break;
+                    }
                     next_flush_ms = current_start_ms + flush_interval_ms;
                 }
                 continue;
@@ -650,18 +778,14 @@ int main(int argc, char **argv)
                                new_title, sizeof(new_title));
                 new_pid = get_window_pid(dpy, net_wm_pid, (Window)current_window);
 
-                if (strcmp(new_title, current_title) == 0)
+                if (strcmp(new_title, current_title) == 0 && strcmp(new_app, current_app) == 0 && new_pid == current_pid)
+                {
+                    update_session_realtime(upd, db, current_session_id, t_ms);
                     continue;
+                }
 
-                // Close previous tab interval
-                write_record(ins,
-                             current_start_ms, t_ms,
-                             current_window,
-                             current_app,
-                             current_pid,
-                             current_title);
+                close_session(cls, db, current_session_id, t_ms);
 
-                // Open new tab interval
                 current_app[0] = '\0';
                 current_title[0] = '\0';
                 strncpy(current_app, new_app, sizeof(current_app) - 1);
@@ -670,6 +794,11 @@ int main(int argc, char **argv)
                 current_title[sizeof(current_title) - 1] = '\0';
                 current_pid = new_pid;
                 current_start_ms = t_ms;
+                if (open_session(ins, db, current_title, current_app, current_pid, current_start_ms, &current_session_id) != 0)
+                {
+                    g_stop = 1;
+                    break;
+                }
                 next_flush_ms = current_start_ms + flush_interval_ms;
             }
         }
@@ -677,17 +806,12 @@ int main(int argc, char **argv)
 
     // Flush last interval on exit.
     long long end_ms = now_ts_ms();
-    if (current_window != 0 && current_start_ms > 0 && end_ms > current_start_ms)
-    {
-        write_record(ins,
-                     current_start_ms, end_ms,
-                     current_window,
-                     current_app,
-                     current_pid,
-                     current_title);
-    }
+    if (current_window != 0 && current_session_id > 0 && end_ms > current_start_ms)
+        close_session(cls, db, current_session_id, end_ms);
 
     sqlite3_finalize(ins);
+    sqlite3_finalize(upd);
+    sqlite3_finalize(cls);
     sqlite3_close(db);
     XCloseDisplay(dpy);
     return 0;

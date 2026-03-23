@@ -1,9 +1,11 @@
 /*
  * aggregate_app_title.c
  * ----------------------
- * Aggregate activity intervals from SQLite (default) or legacy CSV.
+ * Aggregate activity sessions from SQLite (default) or legacy CSV.
  *
- * SQLite table `intervals`: start_ms, end_ms, window_id, app_class, pid, title
+ * SQLite table `window_sessions`:
+ *   id, window_title, process_name, process_id,
+ *   started_at_utc, last_seen_at_utc, ended_at_utc, duration_seconds, is_open
  *
  * CSV schema (header may exist):
  *   start_ts,end_ts,window_id,app_class,pid,title
@@ -305,8 +307,11 @@ static int load_records_db(const char *path, ActivityRec **out, size_t *n_out)
 
     sqlite3_stmt *st = NULL;
     const char *sql =
-        "SELECT start_ms, end_ms, window_id, app_class, pid, title "
-        "FROM intervals ORDER BY start_ms ASC, id ASC;";
+        "SELECT id, started_at_utc, "
+        "       COALESCE(ended_at_utc, last_seen_at_utc) AS end_utc, "
+        "       process_name, process_id, window_title "
+        "FROM window_sessions "
+        "ORDER BY started_at_utc ASC, id ASC;";
     if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK)
     {
         fprintf(stderr, "sqlite prepare: %s\n", sqlite3_errmsg(db));
@@ -318,14 +323,16 @@ static int load_records_db(const char *path, ActivityRec **out, size_t *n_out)
     {
         ActivityRec r;
         memset(&r, 0, sizeof(r));
-        r.start_ms = (long long)sqlite3_column_int64(st, 0);
-        r.end_ms = (long long)sqlite3_column_int64(st, 1);
-        const char *wid = (const char *)sqlite3_column_text(st, 2);
+        long long row_id = (long long)sqlite3_column_int64(st, 0);
+        long long started_utc = (long long)sqlite3_column_int64(st, 1);
+        long long end_utc = (long long)sqlite3_column_int64(st, 2);
         const char *ac = (const char *)sqlite3_column_text(st, 3);
         r.pid = (unsigned long)sqlite3_column_int64(st, 4);
         const char *tt = (const char *)sqlite3_column_text(st, 5);
-        if (wid)
-            strncpy(r.window_id, wid, sizeof(r.window_id) - 1);
+
+        r.start_ms = started_utc * 1000LL;
+        r.end_ms = end_utc * 1000LL;
+        snprintf(r.window_id, sizeof(r.window_id), "sess:%lld", row_id);
         if (ac)
             strncpy(r.app_class, ac, sizeof(r.app_class) - 1);
         if (tt)
@@ -376,7 +383,7 @@ static void usage(const char *argv0)
             "Usage: %s [--db FILE.db | --in FILE.csv] [--mode history|totals] [--top N] [--limit N]\n"
             "\n"
             "Input (default: SQLite activity.db):\n"
-            "  --db PATH   Read intervals from SQLite table `intervals`.\n"
+            "  --db PATH   Read sessions from SQLite table `window_sessions`.\n"
             "  --in PATH   Read legacy CSV (same columns as before).\n"
             "\n"
             "Modes:\n"
