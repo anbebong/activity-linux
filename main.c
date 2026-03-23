@@ -25,6 +25,9 @@
 #define PATH_MAX 4096
 #endif
 
+/* Mặc định khi không truyền --out (triển khai: /opt/lancsmaster/data/). */
+#define ACTIVITY_DEFAULT_DB "/opt/lancsmaster/data/activity.db"
+
 static volatile sig_atomic_t g_stop = 0;
 
 static void handle_signal(int sig)
@@ -248,7 +251,7 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s [--out FILE.db]\n"
             "Track X11 active window/tab by title changes (records start/end in SQLite).\n"
-            "Default DB: activity.db\n"
+            "Default DB: " ACTIVITY_DEFAULT_DB "\n"
             "Daily rotation: at local midnight, FILE.db is renamed to STEM_YYYY-MM-DD.db\n"
             "and a new FILE.db is created (same window continues with a fresh interval).\n",
             argv0);
@@ -406,7 +409,7 @@ static int rotate_db_at_day_change(
 
 int main(int argc, char **argv)
 {
-    const char *out_arg = "activity.db";
+    const char *out_arg = ACTIVITY_DEFAULT_DB;
     const long long flush_interval_ms = 30000LL; // flush current tab every ~30s
 
     for (int i = 1; i < argc; i++)

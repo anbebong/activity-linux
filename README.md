@@ -31,15 +31,56 @@ Sau khi build:
 
 ## Run tracker (SQLite)
 
-Mặc định ghi file `activity.db` (hoặc chỉ định `--out`):
+Mặc định ghi **`/opt/lancsmaster/data/activity.db`** (hoặc chỉ định `--out PATH`):
 
 ```bash
-cd /home/an/Desktop/activity
-rm -f activity.db
-./out/activity-tracker --out activity.db
+sudo mkdir -p /opt/lancsmaster/data
+# quyền ghi cho user chạy tracker (tuỳ site)
+./out/activity-tracker
+# hoặc: ./out/activity-tracker --out ./activity.db
 ```
 
 Dừng bằng `Ctrl+C`.
+
+## Autostart khi đăng nhập GUI (XDG)
+
+Triển khai khớp file mẫu **`autostart/activity-tracker.desktop.example`**: binary và DB nằm trực tiếp dưới **`/opt/lancsmaster/`** (không dùng thư mục `bin/`).
+
+| Đường dẫn | Nội dung |
+|-----------|----------|
+| `/opt/lancsmaster/activity-tracker` | Binary đã build |
+| `/opt/lancsmaster/data/activity.db` | File SQLite (`data/` cần quyền ghi cho user đăng nhập GUI) |
+
+### Cài binary + thư mục dữ liệu
+
+```bash
+sudo mkdir -p /opt/lancsmaster/data
+sudo install -m755 out/activity-tracker /opt/lancsmaster/activity-tracker
+# Cho phép user đăng nhập GUI ghi DB (thay USER bằng tài khoản thật):
+sudo chown USER:USER /opt/lancsmaster/data
+```
+
+### File `.desktop` (autostart)
+
+Mẫu trong repo: **`autostart/activity-tracker.desktop.example`**. Trong file có placeholder **`@ACTIVITY_TRACKER_BIN@`** và **`@ACTIVITY_TRACKER_DB@`** — script cài đặt sẽ thay bằng đường dẫn thật (mặc định giống bố trí `/opt/lancsmaster/...`).
+
+Các khóa chính (sau khi thay placeholder):
+
+- **`Exec`**: `sh -c 'exec …/activity-tracker --out …/data/activity.db'`
+- **`TryExec`**: đường dẫn binary (một số DE bỏ qua nếu file không tồn tại)
+- **`Name`**, **`Comment`**, **`Terminal=false`**, **`StartupNotify=false`**, **`X-GNOME-Autostart-enabled=true`**
+
+Cách 1 — copy tay: phải **tự thay** `@ACTIVITY_TRACKER_BIN@` / `@ACTIVITY_TRACKER_DB@` (hoặc sửa `Exec` / `TryExec`) rồi đặt vào `~/.config/autostart/`.
+
+Cách 2 — **khuyến nghị**: script đọc mẫu, thay placeholder, ghi `~/.config/autostart/lancsmaster-activity-tracker.desktop`:
+
+```bash
+./scripts/install-autostart.sh
+```
+
+Mặc định: **`/opt/lancsmaster/activity-tracker`** và **`/opt/lancsmaster/data/activity.db`**. Đổi gốc bằng `LANCSMASTER_ROOT`, hoặc `--binary` / `--db` khi dev. Đổi file mẫu: biến **`ACTIVITY_DESKTOP_TEMPLATE`** (đường dẫn tuyệt đối tới `.desktop` mẫu).
+
+Gỡ autostart: `rm ~/.config/autostart/lancsmaster-activity-tracker.desktop`
 
 Bảng `intervals`:
 
@@ -60,9 +101,10 @@ Chế độ `history` gộp các snapshot heartbeat trùng (theo `window_id`, pi
 
 ```bash
 ./out/aggregate-app-title --db activity.db --mode history --limit 50
+# Triển khai cùng autostart (/opt): thêm --db /opt/lancsmaster/data/activity.db
 ```
 
-Mặc định đọc `--db activity.db` nên có thể bỏ `--db` nếu file tên đúng vậy:
+Mặc định đọc `--db activity.db` (thư mục hiện tại); với DB mặc định của tracker dùng `--db /opt/lancsmaster/data/activity.db` hoặc `cd` tới thư mục chứa `activity.db`.
 
 ```bash
 ./out/aggregate-app-title --mode history --limit 50

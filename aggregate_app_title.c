@@ -19,6 +19,9 @@
 
 #include <sqlite3.h>
 
+/* Mặc định khi không truyền --db (triển khai: /opt/lancsmaster/data/). */
+#define ACTIVITY_DEFAULT_DB "/opt/lancsmaster/data/activity.db"
+
 typedef struct
 {
     char app_class[256];
@@ -393,7 +396,7 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
     int src_use_csv = 0;
-    const char *input_path = "activity.db";
+    const char *input_path = ACTIVITY_DEFAULT_DB;
     int mode_history = 0;      // 1 => merged history, 2 => raw history
     size_t topn = 10;
     size_t limit = 0;

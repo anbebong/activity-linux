@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0.0
+Name=Lancsmaster activity tracker
+Comment=Tool activitywatch for Lancs
+# install-autostart.sh thay @ACTIVITY_TRACKER_BIN@ và @ACTIVITY_TRACKER_DB@ (mặc định /opt/lancsmaster/...).
+Exec=/bin/sh -c 'exec @ACTIVITY_TRACKER_BIN@ --out @ACTIVITY_TRACKER_DB@'
+TryExec=@ACTIVITY_TRACKER_BIN@
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+# GNOME / một số DE
+X-GNOME-Autostart-enabled=true
