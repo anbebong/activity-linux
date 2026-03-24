@@ -142,7 +142,14 @@ static int init_sqlite(sqlite3 *db)
     }
     sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_open ON window_sessions(is_open, last_seen_at_utc);",
                  NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_started_at ON window_sessions(started_at_utc);",
+                 NULL, NULL, NULL);
+    sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_process_title ON window_sessions(process_name, window_title, started_at_utc);",
+                 NULL, NULL, NULL);
     sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA busy_timeout=3000;", NULL, NULL, NULL);
+    sqlite3_exec(db, "PRAGMA wal_autocheckpoint=1000;", NULL, NULL, NULL);
     return 0;
 }
 
