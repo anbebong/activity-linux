@@ -1,131 +1,129 @@
-# activity (X11 active window / tab tracker)
+# activity — theo dõi cửa sổ đang focus (X11)
+
+Tracker đọc `_NET_ACTIVE_WINDOW` trên X11, ghi **phiên cửa sổ** (session) vào SQLite. Mỗi lần đổi cửa sổ hoặc đổi tiêu đề (ví dụ đổi tab), phiên cũ được đóng và phiên mới mở; trong lúc giữ focus, tracker **cập nhật định kỳ** (~5 giây) thời lượng phiên đang mở.
+
+Tài liệu thiết kế chi tiết: [`DESIGN_X11.md`](DESIGN_X11.md) (một số đoạn có thể còn nhắc schema cũ `intervals`; **schema thực tế hiện tại là `window_sessions`** — xem bên dưới).
+
+## Thành phần trong thư mục này
+
+| Output (sau `make`) | Mô tả |
+|---------------------|--------|
+| `out/activity-tracker` | Daemon X11, ghi `activity.db` |
+
+**Xem / truy vấn dữ liệu:** dùng **`tools/activitydb`** (Go) — lệnh `query`, `stats`, `raw` hoặc `serve` (web UI + API). Build: `tools/activitydb/build_activitydb.sh` hoặc `cd tools/activitydb && go build`.
 
 ## Build
 
-### SQLite: bắt buộc amalgamation (từ sqlite.org, **không** dùng `libsqlite3` hệ thống)
+### SQLite: bắt buộc amalgamation (trong repo)
 
-1. Đặt **`sqlite3.c`** và **`sqlite3.h`** vào `third_party/sqlite/` (xem `third_party/sqlite/README.md`), hoặc chạy script (đổi mã bản nếu URL 404):
+Dự án **chỉ** biên dịch SQLite từ amalgamation (`third_party/sqlite/sqlite3.c` + `sqlite3.h`), không link `libsqlite3` hệ thống. Nếu thiếu file, `make` sẽ báo lỗi; xem `third_party/sqlite/README.md`.
 
-   ```bash
-   ./scripts/fetch-sqlite-amalgamation.sh 3500600
-   # hoặc: export SQLITE_DL_YEAR=2024  # nếu năm trong URL không khớp
-   ```
+Có thể tải bản mới bằng script (đổi mã bản nếu URL 404):
 
-2. Chỉ cài X11:
+```bash
+cd activity
+./scripts/fetch-sqlite-amalgamation.sh 3500600
+# hoặc: export SQLITE_DL_YEAR=2024
+```
 
-   ```bash
-   sudo apt install build-essential libx11-dev
-   ```
+### Phụ thuộc hệ thống (Debian/Ubuntu)
 
-3. Build — Makefile compile `out/sqlite3.o` từ amalgamation và link vào cả hai binary. Thiếu `sqlite3.c`/`sqlite3.h` → `make` báo lỗi rõ ràng.
+```bash
+sudo apt install build-essential libx11-dev
+```
 
-   ```bash
-   cd /home/an/Desktop/activity
-   make clean && make
-   ```
+### Build cục bộ
 
-Sau khi build:
+```bash
+cd activity
+make clean && make
+```
 
-- `out/activity-tracker` — tracker X11, ghi vào SQLite
-- `out/aggregate-app-title` — đọc DB (mặc định) hoặc CSV cũ để tổng hợp
+Binary nằm trong `activity/out/`.
 
-## Run tracker (SQLite)
+### Build trong Docker (môi trường CentOS 7 cố định)
 
-Mặc định ghi **`/opt/lancsmaster/data/activity.db`** (hoặc chỉ định `--out PATH`):
+```bash
+cd activity
+./scripts/build-in-docker.sh
+```
+
+Artifact được copy về `activity/out/` trên host.
+
+## Chạy tracker
+
+Mặc định ghi **`/opt/lancsmaster/data/activity.db`** nếu không truyền `--out`:
 
 ```bash
 sudo mkdir -p /opt/lancsmaster/data
-# quyền ghi cho user chạy tracker (tuỳ site)
 ./out/activity-tracker
 # hoặc: ./out/activity-tracker --out ./activity.db
 ```
 
-Dừng bằng `Ctrl+C`.
+Dừng: `Ctrl+C` hoặc gửi SIGTERM.
 
-## Autostart khi đăng nhập GUI (XDG)
+### Xoay file theo ngày (local midnight)
 
-Triển khai khớp file mẫu **`autostart/activity-tracker.desktop.example`**: binary và DB nằm trực tiếp dưới **`/opt/lancsmaster/`** (không dùng thư mục `bin/`).
+Khi sang ngày mới (theo timezone local), file đang ghi (ví dụ `activity.db`) được đổi tên thành `activity_YYYY-MM-DD.db` (ngày vừa kết thúc), rồi tạo lại `activity.db` trống. Phiên đang mở được flush trước khi đóng file.
+
+## Schema SQLite: `window_sessions`
+
+| Cột | Kiểu | Ý nghĩa |
+|-----|------|--------|
+| `id` | INTEGER PK | |
+| `window_title` | TEXT | Tiêu đề cửa sổ (snapshot) |
+| `process_name` | TEXT | `WM_CLASS.res_class` (hoặc tương đương) |
+| `process_id` | INTEGER | PID (`_NET_WM_PID`) |
+| `started_at_utc` | INTEGER | Unix **giây** (UTC) bắt đầu phiên |
+| `last_seen_at_utc` | INTEGER | Unix **giây** cập nhật cuối (heartbeat) |
+| `ended_at_utc` | INTEGER | Unix **giây** kết thúc (NULL nếu đang mở) |
+| `duration_seconds` | INTEGER | Độ dài tính đến thời điểm cập nhật |
+| `is_open` | INTEGER | 1 = phiên đang mở, 0 = đã đóng |
+
+**Ghi chú:** Tên cột có `_utc` nhưng giá trị là **Unix epoch seconds** (số nguyên), không phải mili giây.
+
+## Autostart (XDG)
+
+Triển khai khớp mẫu **`autostart/activity-tracker.desktop.example`**: binary và DB thường đặt dưới `/opt/lancsmaster/` (không bắt buộc thư mục `bin/`).
 
 | Đường dẫn | Nội dung |
 |-----------|----------|
-| `/opt/lancsmaster/activity-tracker` | Binary đã build |
-| `/opt/lancsmaster/data/activity.db` | File SQLite (`data/` cần quyền ghi cho user đăng nhập GUI) |
+| `/opt/lancsmaster/activity-tracker` | Binary đã cài |
+| `/opt/lancsmaster/data/activity.db` | SQLite (thư mục `data/` cần quyền ghi cho user GUI) |
 
-### Cài binary + thư mục dữ liệu
+### Cài binary + quyền thư mục dữ liệu
 
 ```bash
 sudo mkdir -p /opt/lancsmaster/data
 sudo install -m755 out/activity-tracker /opt/lancsmaster/activity-tracker
-# Cho phép user đăng nhập GUI ghi DB (thay USER bằng tài khoản thật):
 sudo chown USER:USER /opt/lancsmaster/data
 ```
 
-### File `.desktop` (autostart)
+### File `.desktop`
 
-Mẫu trong repo: **`autostart/activity-tracker.desktop.example`**. Trong file có placeholder **`@ACTIVITY_TRACKER_BIN@`** và **`@ACTIVITY_TRACKER_DB@`** — script cài đặt sẽ thay bằng đường dẫn thật (mặc định giống bố trí `/opt/lancsmaster/...`).
-
-Các khóa chính (sau khi thay placeholder):
-
-- **`Exec`**: `sh -c 'exec …/activity-tracker --out …/data/activity.db'`
-- **`TryExec`**: đường dẫn binary (một số DE bỏ qua nếu file không tồn tại)
-- **`Name`**, **`Comment`**, **`Terminal=false`**, **`StartupNotify=false`**, **`X-GNOME-Autostart-enabled=true`**
-
-Cách 1 — copy tay: phải **tự thay** `@ACTIVITY_TRACKER_BIN@` / `@ACTIVITY_TRACKER_DB@` (hoặc sửa `Exec` / `TryExec`) rồi đặt vào `~/.config/autostart/`.
-
-Cách 2 — **khuyến nghị**: script đọc mẫu, thay placeholder, ghi `~/.config/autostart/lancsmaster-activity-tracker.desktop`:
+Mẫu có placeholder `@ACTIVITY_TRACKER_BIN@` và `@ACTIVITY_TRACKER_DB@`. **Khuyến nghị** dùng script:
 
 ```bash
 ./scripts/install-autostart.sh
 ```
 
-Mặc định: **`/opt/lancsmaster/activity-tracker`** và **`/opt/lancsmaster/data/activity.db`**. Đổi gốc bằng `LANCSMASTER_ROOT`, hoặc `--binary` / `--db` khi dev. Đổi file mẫu: biến **`ACTIVITY_DESKTOP_TEMPLATE`** (đường dẫn tuyệt đối tới `.desktop` mẫu).
+Mặc định: `/opt/lancsmaster/activity-tracker` và `/opt/lancsmaster/data/activity.db`. Dev có thể:
+
+```bash
+./scripts/install-autostart.sh \
+  --binary "$(pwd)/out/activity-tracker" \
+  --db "$(pwd)/activity.db"
+```
 
 Gỡ autostart: `rm ~/.config/autostart/lancsmaster-activity-tracker.desktop`
 
-Bảng `intervals`:
+## Truy vấn & giao diện (Go)
 
-| Cột | Kiểu | Ý nghĩa |
-|-----|------|--------|
-| `start_ms`, `end_ms` | INTEGER | Unix epoch milliseconds |
-| `window_id` | TEXT | Ví dụ `0x12345678` |
-| `app_class`, `title` | TEXT | |
-| `pid` | INTEGER | |
-
-Logic giữ như trước: đổi cửa sổ / đổi title (tab) ghi interval; heartbeat ~30s ghi snapshot `(current_start, now)` **không** đổi `current_start` cho đến khi đổi tab/cửa sổ.
-
-**Xoay DB theo ngày (local midnight):** khi sang ngày mới, file hiện tại (vd. `activity.db`) được đổi tên thành `activity_YYYY-MM-DD.db` (ngày vừa kết thúc), rồi tạo lại `activity.db` trống và ghi tiếp. Interval đang mở được flush trước khi đóng file; trên cửa sổ vẫn focus thì bắt đầu interval mới tại thời điểm xoay.
-
-## Xem history (theo thời gian)
-
-Chế độ `history` gộp các snapshot heartbeat trùng (theo `window_id`, pid, app, title):
+Ví dụ với binary `activitydb` đã build:
 
 ```bash
-./out/aggregate-app-title --db activity.db --mode history --limit 50
-# Triển khai cùng autostart (/opt): thêm --db /opt/lancsmaster/data/activity.db
+activitydb query --activity-db ./activity.db --from "2026-03-01 00:00:00" --top 10
+activitydb serve --addr 127.0.0.1:8765 --activity-db ./activity.db
 ```
 
-Mặc định đọc `--db activity.db` (thư mục hiện tại); với DB mặc định của tracker dùng `--db /opt/lancsmaster/data/activity.db` hoặc `cd` tới thư mục chứa `activity.db`.
-
-```bash
-./out/aggregate-app-title --mode history --limit 50
-```
-
-`history_raw` in từng dòng bản ghi (có thể overlap do heartbeat):
-
-```bash
-./out/aggregate-app-title --mode history_raw --limit 50
-```
-
-## Tổng thời gian theo (app_class, title)
-
-```bash
-./out/aggregate-app-title --mode totals --top 10
-```
-
-## CSV cũ (tuỳ chọn)
-
-```bash
-./out/aggregate-app-title --in activity_usage.csv --mode totals --top 10
-```
-
-Schema CSV: `start_ts,end_ts,window_id,app_class,pid,title` (ISO local có ms).
+Xem `activitydb` (không tham số) để in usage đầy đủ.

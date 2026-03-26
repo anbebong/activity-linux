@@ -22,13 +22,11 @@ SQLITE3_CFLAGS := -I$(SQLITE_DIR) \
 VENDOR_SQLITE_LDLIBS ?= -lpthread -ldl
 
 TRACKER_TARGET ?= out/activity-tracker
-AGG_TARGET ?= out/aggregate-app-title
 SRC ?= main.c
-AGG_SRC ?= aggregate_app_title.c
 
 .PHONY: all clean
 
-all: $(TRACKER_TARGET) $(AGG_TARGET)
+all: $(TRACKER_TARGET)
 
 $(SQLITE_OBJ): $(SQLITE_DIR)/sqlite3.c $(SQLITE_DIR)/sqlite3.h
 	@mkdir -p $(dir $@)
@@ -38,9 +36,5 @@ $(TRACKER_TARGET): $(SRC) $(SQLITE_OBJ)
 	@mkdir -p $(dir $(TRACKER_TARGET))
 	$(CC) $(CFLAGS) -I$(SQLITE_DIR) $(SRC) $(SQLITE_OBJ) -o $@ -lX11 $(VENDOR_SQLITE_LDLIBS)
 
-$(AGG_TARGET): $(AGG_SRC) $(SQLITE_OBJ)
-	@mkdir -p $(dir $(AGG_TARGET))
-	$(CC) $(CFLAGS) -I$(SQLITE_DIR) $(AGG_SRC) $(SQLITE_OBJ) -o $@ $(VENDOR_SQLITE_LDLIBS)
-
 clean:
-	rm -f $(TRACKER_TARGET) $(AGG_TARGET) $(SQLITE_OBJ)
+	rm -f $(TRACKER_TARGET) $(SQLITE_OBJ)

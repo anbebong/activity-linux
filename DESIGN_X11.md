@@ -39,19 +39,11 @@ Thuc te de de maintain, tach thanh 2 module:
 - Snapshot metadata (app_class/title/pid) tai thoi diem mo interval.
 - Ghi record interval vao SQLite (append INSERT).
 
-### Module B: Aggregator (tong hop thong ke)
-- Doc SQLite (`aggregate-app-title --db`) hoac CSV legacy (`--in`).
-- Cong don duration_ms theo key:
-  - mac dinh: `app_class`
-  - co the mo rong: theo `title`
-- (Toi thieu cho v1) Aggregator thuong chay theo che do "one-shot": doc toan bo CSV va tinh tong.
-- (Co the mo rong sau) Cong them che do incremental:
-  - luu vi tri file (byte offset) da doc vao state file
-  - lan chay tiep theo chi doc phan moi.
+### Module B: Truy van / UI (ngoai thu muc activity)
+- Doc SQLite bang `window_sessions` qua tool Go **`tools/activitydb`**: `query`, `stats`, `raw`, `serve` (web + API).
 
-## Giao tiep giua 2 module
-- Contract chinh: file SQLite + bang `intervals`.
-- CSV chi con la tuy chon tuong thich nguoc (`--in`).
+## Giao tiep giua tracker va tool phan tich
+- Contract chinh: file SQLite + bang `window_sessions` (xem README activity).
 
 ## Dinh dang CSV (legacy)
 - header: `start_ts,end_ts,window_id,app_class,pid,title` (ISO local + ms).

@@ -10,7 +10,7 @@ Sau đó từ thư mục gốc project:
 make clean && make
 ```
 
-Nếu có `third_party/sqlite/sqlite3.c`, Makefile sẽ **tự dùng source này** (compile `out/sqlite3.o` và link vào cả tracker và aggregate), **không** link `-lsqlite3` hệ thống.
+Nếu có `third_party/sqlite/sqlite3.c`, Makefile sẽ **tự dùng source này** (compile `out/sqlite3.o` và link vào `activity-tracker`), **không** link `-lsqlite3` hệ thống.
 
 Chỉ cần X11 dev:
 
