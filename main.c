@@ -20,6 +20,48 @@
 #include <string.h>
 #include <time.h>
 #include <sys/select.h>
+#include <unistd.h>
+#include <pwd.h>
+
+/* File ánh xạ local_user=auth_user; auth_user là tên dùng cho API và token_<user>.json. */
+#define USERMAP_FILE "/opt/lancsmaster/usermap.cfg"
+
+static char g_username[256] = "";
+
+/* Đọc usermap để tìm auth_user theo local_user. Trả về 1 nếu có, 0 nếu không. */
+static int lookup_usermap(const char *local, char *out, size_t out_sz)
+{
+    if (!local || !*local) return 0;
+    FILE *fp = fopen(USERMAP_FILE, "r");
+    if (!fp) return 0;
+    size_t klen = strlen(local);
+    char line[1024];
+    int found = 0;
+    while (fgets(line, sizeof(line), fp))
+    {
+        size_t n = strlen(line);
+        while (n > 0 && (line[n-1] == '\n' || line[n-1] == '\r')) line[--n] = '\0';
+        if (line[0] == '\0' || line[0] == '#') continue;
+        if (strncmp(line, local, klen) == 0 && line[klen] == '=')
+        {
+            const char *val = line + klen + 1;
+            snprintf(out, out_sz, "%s", val);
+            found = 1;
+            break;
+        }
+    }
+    fclose(fp);
+    return found;
+}
+
+/* Xác định username sẽ ghi vào DB: ưu tiên usermap, fallback local user. Gọi 1 lần lúc start. */
+static void resolve_username(void)
+{
+    struct passwd *pw = getpwuid(getuid());
+    const char *local = (pw && pw->pw_name) ? pw->pw_name : "";
+    if (!lookup_usermap(local, g_username, sizeof(g_username)))
+        snprintf(g_username, sizeof(g_username), "%s", local);
+}
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -131,7 +173,8 @@ static int init_sqlite(sqlite3 *db)
         "last_seen_at_utc INTEGER NOT NULL,"
         "ended_at_utc INTEGER,"
         "duration_seconds INTEGER NOT NULL DEFAULT 0,"
-        "is_open INTEGER NOT NULL DEFAULT 1"
+        "is_open INTEGER NOT NULL DEFAULT 1,"
+        "username TEXT NOT NULL DEFAULT ''"
         ");";
     char *err = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK)
@@ -140,6 +183,9 @@ static int init_sqlite(sqlite3 *db)
         sqlite3_free(err);
         return -1;
     }
+    /* Migration cho DB cũ: thêm cột username nếu chưa có. */
+    sqlite3_exec(db, "ALTER TABLE window_sessions ADD COLUMN username TEXT NOT NULL DEFAULT '';",
+                 NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_open ON window_sessions(is_open, last_seen_at_utc);",
                  NULL, NULL, NULL);
     sqlite3_exec(db, "CREATE INDEX IF NOT EXISTS idx_window_sessions_started_at ON window_sessions(started_at_utc);",
@@ -340,6 +386,7 @@ static int open_session(sqlite3_stmt *ins,
     sqlite3_bind_int64(ins, 4, (sqlite3_int64)now_s);
     sqlite3_bind_int64(ins, 5, (sqlite3_int64)now_s);
     sqlite3_bind_int64(ins, 6, (sqlite3_int64)0);
+    sqlite3_bind_text(ins, 7, g_username, -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(ins) != SQLITE_DONE)
     {
@@ -545,6 +592,9 @@ int main(int argc, char **argv)
     const char *out_arg = ACTIVITY_DEFAULT_DB;
     const long long flush_interval_ms = 5000LL; // flush current tab every ~5s
 
+    resolve_username();
+    fprintf(stderr, "activity tracker: username=%s\n", g_username);
+
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--out") == 0 && i + 1 < argc)
@@ -596,8 +646,8 @@ int main(int argc, char **argv)
 
     static const char ins_sql[] =
         "INSERT INTO window_sessions "
-        "(window_title,process_name,process_id,started_at_utc,last_seen_at_utc,duration_seconds,is_open) "
-        "VALUES (?,?,?,?,?,?,1);";
+        "(window_title,process_name,process_id,started_at_utc,last_seen_at_utc,duration_seconds,is_open,username) "
+        "VALUES (?,?,?,?,?,?,1,?);";
     static const char upd_sql[] =
         "UPDATE window_sessions "
         "SET last_seen_at_utc=?, "
